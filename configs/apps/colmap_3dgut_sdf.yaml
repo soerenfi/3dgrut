@@ -1,0 +1,21 @@
+# @package _global_
+
+# SDF-regularized 3DGUT on COLMAP datasets.
+# Co-trains a neural SDF alongside Gaussians to enforce continuous surfaces in
+# textureless regions — no depth or normal supervision required.
+# The SDF learns purely from the Gaussian opacity distribution + eikonal constraint.
+
+defaults:
+  - /base_gs
+  - /dataset: colmap
+  - /initialization: colmap
+  - /render: 3dgut
+  - _self_
+
+val_frequency: 999999 # never validate
+
+loss:
+  use_sdf: true
+  lambda_sdf: 0.1
+  lambda_sdf_eikonal: 0.5
+  sdf_warmup_steps: 3000

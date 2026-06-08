@@ -126,6 +126,13 @@ loss:
   use_depth: false
   lambda_depth: 0.1
 
+  use_sdf: false
+  lambda_sdf: 0.1         # overall SDF loss weight
+  lambda_sdf_eikonal: 0.5 # eikonal sub-weight (relative to pull+push)
+  sdf_warmup_steps: 3000  # steps before push loss activates (SDF trains first)
+  sdf_n_sample: 4096      # Gaussians sampled per step for pull/push
+  sdf_n_eikonal: 2048     # random scene points sampled per step for eikonal
+
 # Post-processing configuration
 post_processing:
   method: null # Possible values: null, "ppisp"

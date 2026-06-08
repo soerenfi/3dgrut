@@ -34,6 +34,7 @@ from threedgrut.datasets.protocols import BoundedMultiViewDataset
 from threedgrut.datasets.utils import DEFAULT_DEVICE, MultiEpochsDataLoader, PointCloud
 from threedgrut.model.losses import ssim
 from threedgrut.model.model import MixtureOfGaussians
+from threedgrut.model.sdf import SDFMLP
 from threedgrut.optimizers import SelectiveAdam
 from threedgrut.render import Renderer
 from threedgrut.strategy.base import BaseStrategy
@@ -132,6 +133,7 @@ class Trainer3DGRUT:
         self.setup_training(conf, self.model, self.train_dataset)
         self.init_experiments_tracking(conf)
         self.init_post_processing(conf)
+        self.init_sdf(conf)
         self.init_gui(conf, self.model, self.train_dataset, self.val_dataset, self.scene_bbox)
 
     def init_dataloaders(self, conf: DictConfig):
@@ -424,6 +426,14 @@ class Trainer3DGRUT:
         else:
             raise ValueError(f"Unknown post-processing method: {method}")
 
+    def init_sdf(self, conf: DictConfig) -> None:
+        self.sdf_mlp = None
+        self.sdf_optimizer = None
+        if getattr(conf.loss, "use_sdf", False):
+            self.sdf_mlp = SDFMLP(hidden=64).to(self.device)
+            self.sdf_optimizer = torch.optim.Adam(self.sdf_mlp.parameters(), lr=1e-4)
+            logger.info("🔲 SDF regularizer enabled (pull + eikonal + push)")
+
     @torch.cuda.nvtx.range("get_metrics")
     def get_metrics(
         self,
@@ -579,10 +589,51 @@ class Trainer3DGRUT:
                     )
                     lambda_depth = self.conf.loss.lambda_depth
 
+        # SDF regularization: co-train a neural SDF alongside Gaussians.
+        # No GT depth/normals required — the SDF learns from the Gaussian opacity
+        # distribution and the eikonal constraint enforces a valid distance field.
+        loss_sdf = torch.zeros(1, device=self.device)
+        lambda_sdf = 0.0
+        if getattr(self.conf.loss, "use_sdf", False) and self.sdf_mlp is not None:
+            with torch.cuda.nvtx.range("loss-sdf"):
+                n_sample = min(self.conf.loss.sdf_n_sample, self.model.num_gaussians)
+                n_eik = self.conf.loss.sdf_n_eikonal
+                idx = torch.randperm(self.model.num_gaussians, device=self.device)[:n_sample]
+
+                # Pull: teach the SDF where surfaces are.
+                # Detach positions so gradients flow only into the SDF MLP here.
+                pos_det = self.model.get_positions()[idx].detach()
+                density_det = self.model.get_density().squeeze()[idx].detach()
+                pull_loss = (self.sdf_mlp(pos_det).abs().squeeze() * density_det).mean()
+
+                # Eikonal: enforce |∇SDF| = 1 at random scene points.
+                bbox_min = self.scene_bbox[0].to(self.device)
+                bbox_max = self.scene_bbox[1].to(self.device)
+                pts_eik = (torch.rand(n_eik, 3, device=self.device)
+                           * (bbox_max - bbox_min) + bbox_min)
+                pts_eik.requires_grad_(True)
+                sdf_eik = self.sdf_mlp(pts_eik)
+                grad_eik = torch.autograd.grad(
+                    sdf_eik.sum(), pts_eik, create_graph=True
+                )[0]
+                eikonal_loss = ((grad_eik.norm(dim=-1) - 1) ** 2).mean()
+
+                # Push: move Gaussian centers toward the SDF zero level-set.
+                # Only activates after warmup so the SDF is accurate first.
+                push_loss = torch.zeros(1, device=self.device)
+                if self.global_step >= self.conf.loss.sdf_warmup_steps:
+                    pos_live = self.model.get_positions()[idx]
+                    push_loss = self.sdf_mlp(pos_live).abs().squeeze().mean()
+
+                loss_sdf = (pull_loss
+                            + self.conf.loss.lambda_sdf_eikonal * eikonal_loss
+                            + push_loss)
+                lambda_sdf = self.conf.loss.lambda_sdf
+
         # Total loss
         loss = (lambda_l1 * loss_l1 + lambda_ssim * loss_ssim
                 + lambda_opacity * loss_opacity + lambda_scale * loss_scale
-                + lambda_depth * loss_depth)
+                + lambda_depth * loss_depth + lambda_sdf * loss_sdf)
         return dict(
             total_loss=loss,
             l1_loss=lambda_l1 * loss_l1,
@@ -591,6 +642,7 @@ class Trainer3DGRUT:
             opacity_loss=lambda_opacity * loss_opacity,
             scale_loss=lambda_scale * loss_scale,
             depth_loss=lambda_depth * loss_depth,
+            sdf_loss=lambda_sdf * loss_sdf,
         )
 
     @torch.cuda.nvtx.range("log_validation_iter")
@@ -733,6 +785,9 @@ class Trainer3DGRUT:
             if self.conf.loss.use_depth:
                 depth_loss = np.mean(batch_metrics["losses"]["depth_loss"])
                 writer.add_scalar("loss/depth/train", depth_loss, global_step)
+            if getattr(self.conf.loss, "use_sdf", False):
+                sdf_loss = np.mean(batch_metrics["losses"]["sdf_loss"])
+                writer.add_scalar("loss/sdf/train", sdf_loss, global_step)
             if self.post_processing is not None and "post_processing_reg_loss" in batch_metrics["losses"]:
                 post_processing_reg_loss = np.mean(batch_metrics["losses"]["post_processing_reg_loss"])
                 writer.add_scalar(
@@ -1018,6 +1073,11 @@ class Trainer3DGRUT:
         # Scheduler step
         with torch.cuda.nvtx.range(f"train_{global_step}_scheduler"):
             self.model.scheduler_step(global_step)
+
+        # SDF optimizer step
+        if self.sdf_optimizer is not None:
+            self.sdf_optimizer.step()
+            self.sdf_optimizer.zero_grad()
 
         # Post-processing optimizer/scheduler step
         if self.post_processing_optimizers is not None:
