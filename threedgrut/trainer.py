@@ -558,8 +558,31 @@ class Trainer3DGRUT:
                 loss_scale = torch.abs(self.model.get_scale()).mean()
                 lambda_scale = self.conf.loss.lambda_scale
 
+        # Depth supervision: compare rendered ray-distance with Depth Pro z-depth
+        loss_depth = torch.zeros(1, device=self.device)
+        lambda_depth = 0.0
+        if self.conf.loss.use_depth and gpu_batch.depth_gt is not None:
+            with torch.cuda.nvtx.range("loss-depth"):
+                # pred_dist: (1, H, W, 1) ray-distance; rays_dir: (1, H, W, 3) unit dirs
+                # Convert to z-depth: pred_z = pred_dist * |ray_z_component|
+                rays_z = gpu_batch.rays_dir[..., 2].abs().squeeze(0)   # (H, W)
+                pred_z = outputs["pred_dist"].squeeze() * rays_z        # (H, W)  pred_dist is (1,H,W,1)
+                depth_gt = gpu_batch.depth_gt.squeeze(0)               # (H, W)
+                # Restrict to pixels where fisheye ray is near-axial (rays_dir_z close
+                # to 1.0 = small angle from optical axis). Peripheral fisheye pixels have
+                # large ray angles; Depth Pro estimated z-depth there assuming pinhole
+                # geometry, so those estimates are unreliable. ~0.85 ≈ ±32° half-angle.
+                valid = (depth_gt > 0) & (rays_z > 0.85)
+                if valid.any():
+                    loss_depth = torch.nn.functional.huber_loss(
+                        pred_z[valid], depth_gt[valid], delta=0.1
+                    )
+                    lambda_depth = self.conf.loss.lambda_depth
+
         # Total loss
-        loss = lambda_l1 * loss_l1 + lambda_ssim * loss_ssim + lambda_opacity * loss_opacity + lambda_scale * loss_scale
+        loss = (lambda_l1 * loss_l1 + lambda_ssim * loss_ssim
+                + lambda_opacity * loss_opacity + lambda_scale * loss_scale
+                + lambda_depth * loss_depth)
         return dict(
             total_loss=loss,
             l1_loss=lambda_l1 * loss_l1,
@@ -567,6 +590,7 @@ class Trainer3DGRUT:
             ssim_loss=lambda_ssim * loss_ssim,
             opacity_loss=lambda_opacity * loss_opacity,
             scale_loss=lambda_scale * loss_scale,
+            depth_loss=lambda_depth * loss_depth,
         )
 
     @torch.cuda.nvtx.range("log_validation_iter")
@@ -706,6 +730,9 @@ class Trainer3DGRUT:
             if self.conf.loss.use_scale:
                 scale_loss = np.mean(batch_metrics["losses"]["scale_loss"])
                 writer.add_scalar("loss/scale/train", scale_loss, global_step)
+            if self.conf.loss.use_depth:
+                depth_loss = np.mean(batch_metrics["losses"]["depth_loss"])
+                writer.add_scalar("loss/depth/train", depth_loss, global_step)
             if self.post_processing is not None and "post_processing_reg_loss" in batch_metrics["losses"]:
                 post_processing_reg_loss = np.mean(batch_metrics["losses"]["post_processing_reg_loss"])
                 writer.add_scalar(

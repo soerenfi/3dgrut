@@ -1,0 +1,18 @@
+# @package _global_
+
+# Depth-supervised 3DGUT on COLMAP datasets.
+# Requires datasets/<name>/depth/<stem>.npy (Depth Pro z-depth maps)
+# and datasets/<name>/depth_meta.json (crop metadata from preprocess_depth_pro.py).
+
+defaults:
+  - /base_gs
+  - /dataset: colmap
+  - /initialization: colmap
+  - /render: 3dgut
+  - _self_
+
+val_frequency: 999999 # never validate
+
+loss:
+  use_depth: true
+  lambda_depth: 0.1

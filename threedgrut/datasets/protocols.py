@@ -40,6 +40,8 @@ class Batch:
     pixel_coords: Optional[torch.Tensor] = None  # [B, H, W, 2] (x, y) with +0.5 center offset
     # Exposure prior from EXIF metadata (mean-normalized log2 exposure [1], None if unavailable)
     exposure: Optional[torch.Tensor] = None
+    # Depth supervision: z-depth in world units, shape [1, H, W], 0 = invalid pixel
+    depth_gt: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         batch_size = self.T_to_world.shape[0]

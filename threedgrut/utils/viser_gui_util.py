@@ -35,7 +35,8 @@ class ViserGUI:
         self.scene_bbox = scene_bbox
 
         # Initialize Viser server
-        self.server = viser.ViserServer(port=8080)
+        port = getattr(conf, "viser_port", 8080)
+        self.server = viser.ViserServer(port=port)
 
         # GUI state
         self.viz_do_train = True

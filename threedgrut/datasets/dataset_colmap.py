@@ -66,6 +66,15 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         self.test_split_interval = test_split_interval
         self._all_exif_exposures = exif_exposures  # Exposure values for all frames (pre-split)
 
+        # Depth supervision: load metadata once if depth/ directory exists
+        depth_meta_path = os.path.join(path, "depth_meta.json")
+        if os.path.isfile(depth_meta_path):
+            import json
+            with open(depth_meta_path) as f:
+                self.depth_meta = json.load(f)
+        else:
+            self.depth_meta = None
+
         # Worker-based GPU cache for multiprocessing compatibility
         self._worker_gpu_cache = {}
 
@@ -102,6 +111,7 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         # numpy str array of image paths and mask paths
         self.image_paths = self.image_paths[indices]
         self.mask_paths = self.mask_paths[indices]
+        self.depth_paths = self.depth_paths[indices]
 
         self.camera_centers = self.camera_centers[indices]
         self.center, self.length_scale, self.scene_bbox = self.compute_spatial_extents()
@@ -317,6 +327,7 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         self.poses = []
         self.image_paths = []
         self.mask_paths = []
+        self.depth_paths = []
 
         cam_centers = []
         for extr in logger.track(
@@ -338,6 +349,9 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
             self.image_paths.append(image_path)
             self.mask_paths.append(os.path.splitext(image_path)[0] + "_mask.png")
 
+            stem = os.path.splitext(os.path.basename(extr.name))[0]
+            self.depth_paths.append(os.path.join(self.path, "depth", stem + ".npy"))
+
         self.camera_centers = np.array(cam_centers)
         _, diagonal = get_center_and_diag(self.camera_centers)
         self.cameras_extent = diagonal * 1.1
@@ -346,6 +360,7 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
 
         self.image_paths = np.stack(self.image_paths, dtype=str)
         self.mask_paths = np.stack(self.mask_paths, dtype=str)
+        self.depth_paths = np.stack(self.depth_paths, dtype=str)
 
     def _lazy_worker_intrinsics_cache(self):
         """Create intrinsics cache for a specific worker."""
@@ -494,6 +509,12 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
             "frame_idx": idx,
         }
 
+        # Depth supervision: load raw depth map if it exists
+        if self.depth_meta is not None and os.path.exists(self.depth_paths[idx]):
+            output_dict["depth_raw"] = torch.from_numpy(
+                np.load(self.depth_paths[idx]).astype(np.float32)
+            ).unsqueeze(0)  # (1, 1536, 1536)
+
         # Only add mask to dictionary if it exists
         if os.path.exists(mask_path := self.mask_paths[idx]):
             mask = torch.from_numpy(np.array(Image.open(mask_path).convert("L"))).reshape(1, actual_h, actual_w, 1)
@@ -539,6 +560,22 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         # Add exposure prior from EXIF if available (move to GPU)
         if "exposure" in batch and batch["exposure"][0] is not None:
             sample["exposure"] = batch["exposure"].to(self.device)
+
+        # Depth supervision: resize to training resolution and embed in full frame
+        if "depth_raw" in batch and self.depth_meta is not None:
+            import torch.nn.functional as F
+            depth_raw = batch["depth_raw"][0].float().to(self.device)  # (1, 1536, 1536)
+            crop = self.depth_meta["crop"]
+            crop_size, y0, x0 = crop["size"], crop["y0"], crop["x0"]
+            depth_resized = F.interpolate(
+                depth_raw.unsqueeze(0),        # (1, 1, 1536, 1536)
+                size=(crop_size, crop_size),
+                mode="bilinear", align_corners=False,
+            ).squeeze(0).squeeze(0)            # (crop_size, crop_size)
+            H, W = data.shape[1], data.shape[2]  # data is (1, H, W, 3)
+            depth_gt = torch.zeros(H, W, device=self.device, dtype=torch.float32)
+            depth_gt[y0 : y0 + crop_size, x0 : x0 + crop_size] = depth_resized
+            sample["depth_gt"] = depth_gt.unsqueeze(0)  # (1, H, W)
 
         return Batch(**sample)
 
